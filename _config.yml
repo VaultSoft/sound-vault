@@ -1,0 +1,4 @@
+# Keep the multi-GB audio out of the published Pages site so builds stay fast and reliable.
+# All downloads are served from GitHub Releases, not from Pages.
+exclude:
+  - downloads
