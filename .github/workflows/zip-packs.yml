@@ -40,7 +40,7 @@ jobs:
               champ=$(basename "$champdir")
               ch=$(slug "$champ")
               asset="/tmp/zips/${cs}-${ch}.zip"
-              ( cd "$champdir" && zip -qr -X "$asset" . )
+              ( cd "$champdir" && zip -qr -X "$asset" . -i "*.mp3" "*.ogg" )
               echo "  ${cs}-${ch}.zip  <-  ${catname}/${champ}"
               count=$((count + 1))
             done
