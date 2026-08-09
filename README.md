@@ -1,7 +1,7 @@
 # FatherOfDraven Sound Vault
 
-Free League of Legends per-champion voice lines, sound effects and ambient tracks,
-pulled from game files and organized by champion.
+League of Legends champion and skin audio for creators — a mix of gameplay
+recordings and game files, shared free to use, organized by champion.
 
 **Browse & download:** https://vaultsoft.github.io/sound-vault/
 
@@ -12,4 +12,6 @@ pulled from game files and organized by champion.
 - The landing page (`index.html`) links to those release assets.
 - `downloads/` is excluded from the Pages build (`_config.yml`) so the site stays small.
 
-Not affiliated with or endorsed by Riot Games.
+League of Legends and its characters, sounds and other game assets are owned by
+Riot Games and/or their respective rights holders. FatherOfDraven Sound Vault is
+an independent fan project and is not affiliated with or endorsed by Riot Games.
