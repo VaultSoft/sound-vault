@@ -23,6 +23,10 @@ concurrency:
 jobs:
   build-zips:
     runs-on: ubuntu-latest
+    env:
+      # This job never checks out at the workspace root, so the gh CLI has no
+      # git remote to infer the repo from - tell it explicitly.
+      GH_REPO: ${{ github.repository }}
     steps:
       # No repo checkout here: the plan (which packs exist, which changed, and the
       # whole manifest) is derived from the git tree + compare APIs, so we never
