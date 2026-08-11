@@ -2,6 +2,7 @@ name: Zip champion SFX packs
 
 permissions:
   contents: write
+  actions: write
 
 on:
   push:
@@ -9,6 +10,11 @@ on:
     paths:
       - 'downloads/**'
   workflow_dispatch:
+    inputs:
+      rebuild_all:
+        description: 'Rebuild and re-upload EVERY pack (resets all download counts)'
+        type: boolean
+        default: false
 
 concurrency:
   group: zip-packs
@@ -18,39 +24,241 @@ jobs:
   build-zips:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Build one zip per champion
-        run: |
-          set -euo pipefail
-          slug() {
-            echo "$1" \
-              | tr '[:upper:]' '[:lower:]' \
-              | sed -E 's/league of legends//; s/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
-          }
-          mkdir -p /tmp/zips
-          count=0
-          for category in downloads/*/; do
-            catname=$(basename "$category")
-            [ "$catname" = "zips" ] && continue   # ignore any stray output folder
-            cs=$(slug "$catname")
-            for champdir in "$category"*/; do
-              [ -d "$champdir" ] || continue
-              champ=$(basename "$champdir")
-              ch=$(slug "$champ")
-              asset="/tmp/zips/${cs}-${ch}.zip"
-              ( cd "$champdir" && zip -qr -X "$asset" . -i "*.mp3" "*.ogg" )
-              echo "  ${cs}-${ch}.zip  <-  ${catname}/${champ}"
-              count=$((count + 1))
-            done
-          done
-          echo "Built ${count} champion zips, total $(du -sh /tmp/zips | cut -f1)"
-          ls -lhS /tmp/zips | head -20 || true
-
-      - name: Publish zips to the sound-packs release
+      # No repo checkout here: the plan (which packs exist, which changed, and the
+      # whole manifest) is derived from the git tree + compare APIs, so we never
+      # clone the 3.8 GB of audio just to find out nothing changed.
+      - name: Plan changed packs and build manifest
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+          EVENT: ${{ github.event_name }}
+          REBUILD_ALL: ${{ inputs.rebuild_all }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys, datetime
+
+          REPO   = os.environ["REPO"]
+          SHA    = os.environ["SHA"]
+          BEFORE = os.environ.get("BEFORE", "")
+          EVENT  = os.environ["EVENT"]
+          REBUILD_ALL = os.environ.get("REBUILD_ALL", "") == "true"
+
+          AUDIO = (".mp3", ".ogg")
+          RAW      = f"https://raw.githubusercontent.com/{REPO}/main/"
+          RELEASE  = f"https://github.com/{REPO}/releases/download/sound-packs/"
+
+          # Loose audio sitting directly in a category folder (not in a champion
+          # folder) ships as a single file, with a curated title. Keep these asset
+          # names exactly as they are: renaming would orphan live links + counts.
+          LOOSE = {
+            "downloads/League of Legends Sound Effects/father of draven anthem.mp3":
+              {"name": "Father of Draven", "cat": "Anthem", "asset": "father-of-draven-anthem.mp3"},
+            "downloads/League of Legends Ambient Sounds/the howling abyss ambient sounds.mp3":
+              {"name": "Howling Abyss", "cat": "Ambient", "asset": "howling-abyss-ambient.mp3"},
+            "downloads/League of Legends Ambient Sounds/summoners rift ambient sounds.mp3":
+              {"name": "Summoner's Rift", "cat": "Ambient", "asset": "summoners-rift-ambient.mp3"},
+          }
+
+          def gh(*args):
+              # encoding is explicit: champion filenames contain non-ASCII (U+2019
+              # apostrophes), which locale-default decoding would mangle.
+              out = subprocess.run(["gh", *args], capture_output=True, text=True,
+                                   encoding="utf-8")
+              if out.returncode != 0:
+                  raise RuntimeError(f"gh {' '.join(args)} failed: {out.stderr.strip()}")
+              return json.loads(out.stdout or "null")
+
+          def slug(s):
+              s = re.sub(r"league of legends", "", s.lower())
+              s = re.sub(r"[^a-z0-9]+", "-", s)
+              return s.strip("-")
+
+          def catlabel(c):
+              s = re.sub(r"(?i)^league of legends", "", c).strip()
+              s = s.lstrip("-").strip()
+              s = re.sub(r"\s+Sounds$", "", s)
+              return s or c
+
+          # ---- 1. Full picture of downloads/ straight from the git tree --------
+          tree = gh("api", f"repos/{REPO}/git/trees/{SHA}?recursive=1")
+          if tree.get("truncated"):
+              # Reconciling deletions against a partial tree could delete live
+              # assets, so refuse rather than guess.
+              sys.exit("git tree came back truncated - aborting instead of risking asset deletion")
+
+          packs = {}   # key -> pack dict
+          for e in tree.get("tree", []):
+              if e.get("type") != "blob":
+                  continue
+              path = e["path"]
+              if not path.startswith("downloads/"):
+                  continue
+              if not path.lower().endswith(AUDIO):
+                  continue          # skips cover images and any stray non-audio
+              parts = path.split("/")
+              if len(parts) < 3:
+                  continue
+              category, rest = parts[1], parts[2:]
+
+              if len(rest) == 1:                        # loose file in a category
+                  meta = LOOSE.get(path)
+                  if meta is None:                      # a new loose file
+                      stem, ext = os.path.splitext(rest[0])
+                      meta = {"name": stem.strip().title(),
+                              "cat": catlabel(category),
+                              "asset": slug(stem) + ext.lower()}
+                  key = ("loose", path)
+                  packs[key] = {"name": meta["name"], "cat": meta["cat"],
+                                "base": f"downloads/{category}", "asset": meta["asset"],
+                                "kind": "file", "items": [[rest[0], e["size"]]]}
+              else:                                     # champion folder
+                  champ = rest[0]
+                  key = ("champ", category, champ)
+                  p = packs.setdefault(key, {
+                      "name": champ, "cat": catlabel(category),
+                      "base": f"downloads/{category}/{champ}",
+                      "asset": f"{slug(category)}-{slug(champ)}.zip",
+                      "kind": "zip", "items": [],
+                  })
+                  p["items"].append(["/".join(rest[1:]), e["size"]])
+
+          for p in packs.values():
+              p["items"].sort(key=lambda i: i[0].lower())
+              p["n"] = len(p["items"])
+              p["bytes"] = sum(i[1] for i in p["items"])
+
+          ordered = sorted(packs.values(), key=lambda p: (p["name"].lower(), p["cat"]))
+          print(f"{len(ordered)} packs, {sum(p['n'] for p in ordered)} audio files")
+
+          # ---- 2. Which packs actually changed --------------------------------
+          try:
+              rel = gh("api", f"repos/{REPO}/releases/tags/sound-packs")
+              existing = {a["name"] for a in rel.get("assets", [])}
+          except Exception:
+              existing = set()          # release not created yet - first run
+          print(f"{len(existing)} asset(s) currently on the release")
+
+          def pack_for(path):
+              parts = path.split("/")
+              if len(parts) < 3 or parts[0] != "downloads":
+                  return None
+              if len(parts) == 3:
+                  return ("loose", path)
+              return ("champ", parts[1], parts[2])
+
+          rebuild_all = False
+          changed = set()
+          reason = ""
+
+          if REBUILD_ALL:
+              rebuild_all, reason = True, "rebuild_all requested"
+          elif EVENT == "push":
+              if not BEFORE or set(BEFORE) == {"0"}:
+                  rebuild_all, reason = True, "no previous commit to diff against"
+              else:
+                  try:
+                      cmp = gh("api", f"repos/{REPO}/compare/{BEFORE}...{SHA}")
+                      files = cmp.get("files", [])
+                      if len(files) >= 300:      # compare API truncates; don't trust it
+                          rebuild_all, reason = True, f"diff too large ({len(files)}+ files)"
+                      else:
+                          for f in files:
+                              for pth in filter(None, (f.get("filename"), f.get("previous_filename"))):
+                                  k = pack_for(pth)
+                                  if k:
+                                      changed.add(k)
+                          reason = f"{len(files)} changed file(s) in push"
+                  except Exception as ex:
+                      rebuild_all, reason = True, f"compare API failed ({ex})"
+          else:
+              reason = "manual run, manifest only"
+
+          if rebuild_all:
+              changed = set(packs.keys())
+
+          # Self-heal: any pack whose release asset is missing gets built even if
+          # this push didn't touch it.
+          missing = {k for k, p in packs.items() if p["asset"] not in existing}
+          if missing and not rebuild_all:
+              reason += f"; {len(missing)} pack(s) missing their asset"
+          changed |= missing
+          changed &= set(packs.keys())          # ignore deleted packs here
+
+          todo = [packs[k] for k in changed]
+          todo.sort(key=lambda p: p["name"].lower())
+          print(f"rebuild reason: {reason}")
+          print(f"{len(todo)} pack(s) to build:")
+          for p in todo:
+              print(f"  - {p['name']} [{p['cat']}] -> {p['asset']}")
+
+          # ---- 3. Assets for packs that no longer exist -----------------------
+          live_assets = {p["asset"] for p in ordered}
+          stale = sorted(a for a in existing
+                         if a.endswith(".zip") and a not in live_assets)
+          if stale:
+              print("stale assets to delete: " + ", ".join(stale))
+
+          # ---- 4. Emit manifest + work lists ----------------------------------
+          manifest = {
+            "generated": datetime.datetime.now(datetime.timezone.utc)
+                          .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "commit": SHA,
+            "raw": RAW,
+            "release": RELEASE,
+            "packs": [{k: p[k] for k in ("name", "cat", "base", "asset", "kind", "n", "bytes", "items")}
+                      for p in ordered],
+          }
+          with open("/tmp/manifest.json", "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, ensure_ascii=False, separators=(",", ":"))
+              fh.write("\n")
+
+          with open("/tmp/dirs.txt", "w", encoding="utf-8") as fh:
+              for p in todo:
+                  if p["kind"] == "zip":
+                      fh.write(p["base"] + "\n")
+          with open("/tmp/todo.json", "w", encoding="utf-8") as fh:
+              json.dump(todo, fh, ensure_ascii=False)
+          with open("/tmp/stale.txt", "w", encoding="utf-8") as fh:
+              fh.write("\n".join(stale))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"count={len(todo)}\n")
+              fh.write(f"stale={len(stale)}\n")
+          PY
+
+      - name: Fetch only the changed champion folders
+        if: steps.plan.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ ! -s /tmp/dirs.txt ]; then
+            echo "No champion folders to fetch (loose files only)."
+            exit 0
+          fi
+          mkdir -p work && cd work
+          git init -q
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git config core.sparseCheckout true
+          git sparse-checkout init --cone
+          git sparse-checkout set --stdin < /tmp/dirs.txt
+          # blob:none + sparse cone = only the changed folders' audio is downloaded,
+          # instead of the whole 3.8 GB history.
+          git fetch -q --depth=1 --filter=blob:none origin "$SHA"
+          git checkout -q FETCH_HEAD
+          echo "Fetched $(du -sh downloads 2>/dev/null | cut -f1) across $(wc -l < /tmp/dirs.txt) folder(s)."
+
+      - name: Build and upload changed packs
+        if: steps.plan.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           tag="sound-packs"
@@ -58,5 +266,87 @@ jobs:
             gh release create "$tag" \
               --title "League of Legends Sound Packs" \
               --notes "Per-champion sound & voice packs, generated automatically from the downloads/ folder. Each asset is one champion's pack."
-          gh release upload "$tag" /tmp/zips/*.zip --clobber
-          echo "Uploaded $(find /tmp/zips -name '*.zip' | wc -l) assets to release '${tag}'"
+          mkdir -p /tmp/out
+          python3 - <<'PY'
+          import json, os, subprocess, shutil, urllib.parse, urllib.request
+          todo = json.load(open("/tmp/todo.json", encoding="utf-8"))
+          repo = os.environ["REPO"]
+          for p in todo:
+              out = "/tmp/out/" + p["asset"]
+              if p["kind"] == "zip":
+                  src = os.path.join("work", p["base"])
+                  if not os.path.isdir(src):
+                      raise SystemExit(f"expected folder missing after sparse checkout: {src}")
+                  subprocess.run(["zip", "-qr", "-X", out, ".", "-i", "*.mp3", "*.ogg"],
+                                 cwd=src, check=True)
+              else:
+                  # single loose file: publish it as-is
+                  url = ("https://raw.githubusercontent.com/" + repo + "/main/"
+                         + urllib.parse.quote(p["base"] + "/" + p["items"][0][0]))
+                  with urllib.request.urlopen(url) as r, open(out, "wb") as fh:
+                      shutil.copyfileobj(r, fh)
+              print(f"  {p['asset']}  <-  {p['name']} [{p['cat']}]")
+          PY
+          gh release upload "$tag" /tmp/out/* --clobber
+          echo "Uploaded $(ls /tmp/out | wc -l) asset(s); every other asset was left untouched."
+
+      - name: Delete assets for packs that no longer exist
+        if: steps.plan.outputs.stale != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r a; do
+            [ -n "$a" ] || continue
+            echo "deleting stale asset: $a"
+            gh release delete-asset sound-packs "$a" --yes
+          done < /tmp/stale.txt
+
+      - name: Commit manifest.json if it changed
+        id: manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json, os, subprocess
+
+          repo = os.environ["REPO"]
+          new = open("/tmp/manifest.json", "rb").read()
+
+          cur = subprocess.run(["gh", "api", f"repos/{repo}/contents/manifest.json",
+                                "--jq", ".sha + \" \" + (.content|gsub(\"\\n\";\"\"))"],
+                               capture_output=True, text=True, encoding="utf-8")
+          sha = None
+          if cur.returncode == 0 and cur.stdout.strip():
+              sha, _, b64 = cur.stdout.strip().partition(" ")
+              if base64.b64decode(b64) == new:
+                  print("manifest.json unchanged - nothing to commit")
+                  raise SystemExit(0)
+
+          payload = {"message": "Update manifest.json [skip ci]",
+                     "content": base64.b64encode(new).decode(),
+                     "branch": "main"}
+          if sha:
+              payload["sha"] = sha
+          open("/tmp/payload.json", "w").write(json.dumps(payload))
+          out = subprocess.run(["gh", "api", f"repos/{repo}/contents/manifest.json",
+                                "-X", "PUT", "--input", "/tmp/payload.json",
+                                "--jq", ".commit.sha"], capture_output=True, text=True)
+          if out.returncode != 0:
+              raise SystemExit("failed to commit manifest: " + out.stderr)
+          print("committed manifest.json as " + out.stdout.strip())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("committed=1\n")
+          PY
+
+      - name: Refresh the Pages copy of the manifest
+        if: steps.manifest.outputs.committed == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A GITHUB_TOKEN push doesn't trigger other workflows, so nudge Pages
+          # directly. The live page reads the manifest from raw either way, so
+          # this is only keeping the same-origin fallback copy fresh.
+          gh workflow run pages.yml --ref main || echo "could not trigger pages.yml (non-fatal)"
