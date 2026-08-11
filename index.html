@@ -250,7 +250,11 @@ let REL="https://github.com/"+REPO+"/releases/download/sound-packs/";
 let cards=[];
 let DLCOUNTS=null;
 
-function fmtSize(b){const mb=b/1048576;return (mb<100?mb.toFixed(1):Math.round(mb))+" MB";}
+function fmtSize(b){
+  const mb=b/1048576;
+  if(mb<0.1) return Math.max(1,Math.round(b/1024))+" KB";   // don't show "0.0 MB"
+  return (mb<100?mb.toFixed(1):Math.round(mb))+" MB";
+}
 function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
 function fileUrl(base,rel){return RAW+(base+"/"+rel).split("/").map(encodeURIComponent).join("/");}
 function assetOf(v){return v.zip.split("/").pop();}
