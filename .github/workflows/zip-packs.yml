@@ -11,6 +11,10 @@ on:
       - 'downloads/**'
   workflow_dispatch:
     inputs:
+      packs:
+        description: 'Force-rebuild only these packs (comma-separated champion names)'
+        type: string
+        default: ''
       rebuild_all:
         description: 'Rebuild and re-upload EVERY pack (resets all download counts)'
         type: boolean
@@ -37,18 +41,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
-          BEFORE: ${{ github.event.before }}
-          EVENT: ${{ github.event_name }}
+          ONLY: ${{ inputs.packs }}
           REBUILD_ALL: ${{ inputs.rebuild_all }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, re, subprocess, sys, datetime
+          import base64, hashlib, json, os, re, subprocess, sys, datetime
 
           REPO   = os.environ["REPO"]
           SHA    = os.environ["SHA"]
-          BEFORE = os.environ.get("BEFORE", "")
-          EVENT  = os.environ["EVENT"]
+          ONLY   = os.environ.get("ONLY", "")
           REBUILD_ALL = os.environ.get("REBUILD_ALL", "") == "true"
 
           AUDIO = (".mp3", ".ogg")
@@ -134,6 +136,12 @@ jobs:
               p["items"].sort(key=lambda i: i[0].lower())
               p["n"] = len(p["items"])
               p["bytes"] = sum(i[1] for i in p["items"])
+              # Fingerprint of exactly what belongs in this pack. Comparing it
+              # against the last published manifest is what decides a rebuild,
+              # so a cancelled or failed run can never leave a zip stale.
+              p["fp"] = hashlib.sha1(
+                  json.dumps(p["items"], ensure_ascii=False, sort_keys=True).encode("utf-8")
+              ).hexdigest()[:12]
 
           ordered = sorted(packs.values(), key=lambda p: (p["name"].lower(), p["cat"]))
           print(f"{len(ordered)} packs, {sum(p['n'] for p in ordered)} audio files")
@@ -146,58 +154,44 @@ jobs:
               existing = set()          # release not created yet - first run
           print(f"{len(existing)} asset(s) currently on the release")
 
-          def pack_for(path):
-              parts = path.split("/")
-              if len(parts) < 3 or parts[0] != "downloads":
-                  return None
-              if len(parts) == 3:
-                  return ("loose", path)
-              return ("champ", parts[1], parts[2])
+          # Fingerprints from the last published manifest. This - not the push
+          # diff - is what decides a rebuild: it stays correct across cancelled
+          # runs, failed runs, manual asset deletion and force-pushes.
+          prev_fp = {}
+          try:
+              blob = gh("api", f"repos/{REPO}/contents/manifest.json")
+              prev = json.loads(base64.b64decode(blob["content"]).decode("utf-8"))
+              prev_fp = {p["asset"]: p.get("fp") for p in prev.get("packs", [])}
+              print(f"previous manifest has {len(prev_fp)} pack(s), "
+                    f"{sum(1 for v in prev_fp.values() if v)} with fingerprints")
+          except Exception as ex:
+              print(f"no previous manifest to compare against ({ex})")
 
-          rebuild_all = False
-          changed = set()
-          reason = ""
-
-          if REBUILD_ALL:
-              rebuild_all, reason = True, "rebuild_all requested"
-          elif EVENT == "push":
-              if not BEFORE or set(BEFORE) == {"0"}:
-                  rebuild_all, reason = True, "no previous commit to diff against"
-              else:
-                  try:
-                      cmp = gh("api", f"repos/{REPO}/compare/{BEFORE}...{SHA}")
-                      files = cmp.get("files", [])
-                      if len(files) >= 300:      # compare API truncates; don't trust it
-                          rebuild_all, reason = True, f"diff too large ({len(files)}+ files)"
-                      else:
-                          for f in files:
-                              for pth in filter(None, (f.get("filename"), f.get("previous_filename"))):
-                                  k = pack_for(pth)
-                                  if k:
-                                      changed.add(k)
-                          reason = f"{len(files)} changed file(s) in push"
-                  except Exception as ex:
-                      rebuild_all, reason = True, f"compare API failed ({ex})"
-          else:
-              reason = "manual run, manifest only"
-
-          if rebuild_all:
-              changed = set(packs.keys())
-
-          # Self-heal: any pack whose release asset is missing gets built even if
-          # this push didn't touch it.
-          missing = {k for k, p in packs.items() if p["asset"] not in existing}
-          if missing and not rebuild_all:
-              reason += f"; {len(missing)} pack(s) missing their asset"
-          changed |= missing
-          changed &= set(packs.keys())          # ignore deleted packs here
+          wanted = {w.strip().lower() for w in ONLY.split(",") if w.strip()}
+          changed, why = set(), {}
+          for k, p in packs.items():
+              a = p["asset"]
+              if REBUILD_ALL:
+                  changed.add(k); why[a] = "full rebuild"
+              elif wanted and (p["name"].lower() in wanted or a.lower() in wanted):
+                  changed.add(k); why[a] = "named in packs input"
+              elif a not in existing:
+                  changed.add(k); why[a] = "no asset published yet"
+              elif prev_fp.get(a) is None:
+                  # First run after adding fingerprints (or a pack the previous
+                  # manifest predates): the asset exists, so trust it rather than
+                  # rebuild everything and reset every download count.
+                  pass
+              elif prev_fp[a] != p["fp"]:
+                  changed.add(k); why[a] = "contents changed"
 
           todo = [packs[k] for k in changed]
           todo.sort(key=lambda p: p["name"].lower())
-          print(f"rebuild reason: {reason}")
           print(f"{len(todo)} pack(s) to build:")
           for p in todo:
-              print(f"  - {p['name']} [{p['cat']}] -> {p['asset']}")
+              print(f"  - {p['name']} [{p['cat']}] -> {p['asset']}  ({why[p['asset']]})")
+          if not todo:
+              print("  (nothing to rebuild - every published pack matches the tree)")
 
           # ---- 3. Assets for packs that no longer exist -----------------------
           live_assets = {p["asset"] for p in ordered}
@@ -213,7 +207,7 @@ jobs:
             "commit": SHA,
             "raw": RAW,
             "release": RELEASE,
-            "packs": [{k: p[k] for k in ("name", "cat", "base", "asset", "kind", "n", "bytes", "items")}
+            "packs": [{k: p[k] for k in ("name", "cat", "base", "asset", "kind", "n", "bytes", "fp", "items")}
                       for p in ordered],
           }
           with open("/tmp/manifest.json", "w", encoding="utf-8") as fh:
