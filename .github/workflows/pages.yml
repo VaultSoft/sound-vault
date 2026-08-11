@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'index.html'
+      - 'manifest.json'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -30,12 +31,16 @@ jobs:
         with:
           sparse-checkout: |
             index.html
+            manifest.json
           sparse-checkout-cone-mode: false
 
       - name: Stage _site
         run: |
           mkdir -p _site
           cp index.html _site/
+          # Same-origin fallback copy; the page normally reads the manifest from
+          # raw so new packs appear without waiting for a Pages deploy.
+          cp manifest.json _site/ 2>/dev/null || echo "no manifest.json yet"
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
