@@ -221,7 +221,8 @@ jobs:
           with open("/tmp/todo.json", "w", encoding="utf-8") as fh:
               json.dump(todo, fh, ensure_ascii=False)
           with open("/tmp/stale.txt", "w", encoding="utf-8") as fh:
-              fh.write("\n".join(stale))
+              for a in stale:
+                  fh.write(a + "\n")     # trailing newline: `while read` drops a final unterminated line
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"count={len(todo)}\n")
@@ -294,11 +295,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          while IFS= read -r a; do
+          deleted=0
+          while IFS= read -r a || [ -n "$a" ]; do
             [ -n "$a" ] || continue
             echo "deleting stale asset: $a"
             gh release delete-asset sound-packs "$a" --yes
+            deleted=$((deleted + 1))
           done < /tmp/stale.txt
+          if [ "$deleted" -eq 0 ]; then
+            echo "expected to delete $(wc -l < /tmp/stale.txt) asset(s) but deleted none" >&2
+            exit 1
+          fi
+          echo "Deleted ${deleted} stale asset(s)."
 
       - name: Commit manifest.json if it changed
         id: manifest
